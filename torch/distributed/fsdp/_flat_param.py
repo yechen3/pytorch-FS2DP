@@ -3,6 +3,7 @@ import contextlib
 import functools
 import logging
 import os
+import math
 import warnings
 from enum import auto, Enum
 from itertools import accumulate, chain
@@ -477,6 +478,33 @@ class FlatParamHandle:
             parameters every iteration and returns the :class:`FlatParameter` s
             from ``named_parameters()``.
     """
+    
+    enable_flip = True
+    flip = 0
+    pin_front_layers = True
+    num_front_layers = 3
+    num_layers = 24
+    cur_layer = 0
+    # 7B - 50331648*4 / 13B - 78643200*4 / 34B - 143327232*4 / 70B - 201326592*4
+    numel_per_layer = os.environ.get('NUM_PER_LAYER')
+    if numel_per_layer is None:
+        print("Error: Environment variable NUM_PER_LAYER not found.")
+    else:
+        numel_per_layer = int(numel_per_layer)
+    s_shard = os.environ.get('LOCAL_SHARD')
+    if s_shard is None:
+        print("Error: Environment variable LOCAL_SHARD not found.")
+    else:
+        s_shard = int(s_shard)
+    num_gpus = os.environ.get('NUM_GPUS')
+    if num_gpus is None:
+        num_gpus = 4
+    else:
+        num_gpus = int(num_gpus)
+    l_shard = numel_per_layer // (num_gpus // 2) - s_shard
+    smaller_shard_upper_bound = 2700000
+    fixed_shard = s_shard
+    backward = False
 
     ##################
     # INITIALIZATION #
@@ -540,7 +568,7 @@ class FlatParamHandle:
         self.process_group = process_group
         if self._use_fake_all_gather or self._use_fake_reduce:
             self._fake_process_group = FakeProcessGroup(
-                rank=process_group.rank(), world_size=process_group.size()
+                process_group.rank(), process_group.size()
             )
         self.rank = process_group.rank()
         self.world_size = process_group.size()
@@ -585,6 +613,20 @@ class FlatParamHandle:
             params, fully_sharded_module, self._aligned_numel, use_orig_params  # type: ignore[arg-type]
         )
         self._use_unsharded_views(as_params=False)
+
+    def _next_layer(self):
+        print("cur_layer: ", type(self).cur_layer, "type(self).backward:", type(self).backward)
+        type(self).cur_layer += 1
+        if type(self).cur_layer == type(self).num_layers:
+            type(self).cur_layer -= type(self).num_layers
+            type(self).backward ^= True
+            #if type(self).backward:
+            #    print("FLIPPING HERE (2)", flush=True)
+            #    type(self).flip ^= 1
+        #if type(self).cur_layer == type(self).num_layers-1:
+        #if type(self).backward:
+
+        #    type(self).flip ^= 1
 
     def _init_setattr_fns(self):
         use_unsafe_setattr = os.environ.get(_FSDP_USE_UNSAFE_SETATTR, "") == "1"
@@ -911,7 +953,7 @@ class FlatParamHandle:
                 "The `FlatParameter` is not the sole occupant of its storage",
             )
             sharded_flat_param, numel_padded = FlatParamHandle._get_shard(
-                flat_param, self.rank, self.world_size
+                flat_param, self.rank, self.world_size, self.flip
             )
             if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
                 allocated = flat_param._typed_storage()._size() > 0
@@ -923,6 +965,10 @@ class FlatParamHandle:
             self._init_shard_metadata(numel_padded, start_idx, end_idx)
         if self._use_orig_params:
             self._use_sharded_views()
+        if type(self).enable_flip:
+            print("FLIPPING HERE (0)", flush=True)
+            type(self).flip ^= 1
+        self._next_layer()
 
     def _init_shard_metadata(
         self,
@@ -1035,6 +1081,7 @@ class FlatParamHandle:
         tensor: Tensor,
         rank: int,
         world_size: int,
+        flip: int,
     ) -> Tuple[Tensor, int]:
         """
         Return the unpadded shard of ``tensor`` for the given ``rank`` and ``world_size``.
@@ -1046,14 +1093,29 @@ class FlatParamHandle:
         shape (which is true in the expected usage), then this method does not
         allocate any new tensor memory.
         """
-        chunks = torch.flatten(tensor).chunk(world_size)
+        #chunks = torch.flatten(tensor).chunk(world_size)
+        split_size = []
+        length = torch.numel(tensor)
+        total = 0
+        # Yechen: Change split size here
+        for i in range(world_size-1):
+            if (i+flip)%2==0 :
+                size = FlatParamHandle.s_shard#4*30198988#120795956#math.ceil((length/(world_size//2))*0.4)
+            else:
+                size = FlatParamHandle.l_shard#4*70464308#181193932#math.ceil((length/(world_size//2))*0.6)
+            split_size.append(size)
+            total += size
+        split_size.append(length-total)
+        print('length:', length, 'split_size:', split_size)
+        chunks = torch.flatten(tensor).split(split_size)
         if len(chunks) < (rank + 1):
             # This rank gets an empty chunk fully padded with zeros since there
             # are not enough chunks across ranks
             chunk = chunks[0].new_empty(0)
         else:
             chunk = chunks[rank]
-        numel_to_pad = chunks[0].numel() - chunk.numel()
+        #numel_to_pad = chunks[0].numel() - chunk.numel()
+        numel_to_pad = (world_size // 2) * (chunks[0].numel() + chunks[1].numel()) - length
         assert (
             numel_to_pad >= 0
         ), "Chunk's size should be at most the first chunk's size"
@@ -1064,6 +1126,7 @@ class FlatParamHandle:
         tensor: Tensor,
         rank: int,
         world_size: int,
+        flip: int,
     ) -> Tuple[Tensor, int]:
         """
         Return the shard of ``tensor`` with padding for the given ``rank`` and ``world_size`` and the numel padded for that shard.
@@ -1072,10 +1135,10 @@ class FlatParamHandle:
         unsharded ``tensor`` may be deallocated after this method returns.
         """
         chunk, numel_to_pad = FlatParamHandle._get_unpadded_shard(
-            tensor, rank, world_size
+            tensor, rank, world_size, flip
         )
         shard = chunk.clone()
-        if numel_to_pad > 0:
+        if rank==world_size-1 and numel_to_pad > 0:
             shard = F.pad(shard, [0, numel_to_pad])
         return shard, numel_to_pad
 
@@ -1175,7 +1238,11 @@ class FlatParamHandle:
                 self._reduce_dtype = flat_param.dtype
             self._orig_param_dtype = flat_param.dtype
         cpu_device = torch.device("cpu")
-        if self._offload_params:
+        print("init_flat_param_attributes: type(self).cur_layer:", type(self).cur_layer)
+        print("self.flat_param device:", self.flat_param.device)
+        #if self._offload_params and torch.numel(self.flat_param.data) >= type(self).smaller_shard_upper_bound \
+        if self._offload_params and torch.numel(self.flat_param.data) != type(self).fixed_shard \
+            and type(self).cur_layer >= type(self).num_front_layers:
             _p_assert(
                 flat_param.device == cpu_device,
                 f"Expects the `FlatParameter` to be on CPU when parameter CPU "
@@ -1184,11 +1251,16 @@ class FlatParamHandle:
         else:
             self._check_on_compute_device(self.flat_param)
         flat_param._local_shard = flat_param.data
+        print("flat_param._local_shard device:", flat_param._local_shard.device, "flat_param._local_shard:", flat_param._local_shard.numel())
         if self._offload_params:
+            if type(self).pin_front_layers and type(self).cur_layer < type(self).num_front_layers:
+                pass
             # Pin the memory for faster H2D transfer
-            flat_param._local_shard = flat_param._local_shard.pin_memory(
-                device=self.device
-            )
+            #elif (torch.numel(self.flat_param._local_shard) >= type(self).smaller_shard_upper_bound):
+            elif (torch.numel(self.flat_param._local_shard) != type(self).fixed_shard):
+                flat_param._local_shard = flat_param._local_shard.pin_memory(
+                    device=self.device
+                )
             # Pre-allocate the sharded gradient on CPU to enable non-blocking
             # D2H transfer during the backward pass
             flat_param._cpu_grad = torch.zeros_like(
@@ -1214,8 +1286,9 @@ class FlatParamHandle:
                 else flat_param.dtype
             )  # use low precision if parameter mixed precision is enabled
             padded_unsharded_numel = flat_param.numel() * self.world_size
+            # Yechen: Change the total number of size here
             flat_param._full_param_padded = torch.empty(
-                padded_unsharded_numel,
+                type(self).numel_per_layer,#4*201326592, #padded_unsharded_numel,
                 device=self.device,
                 dtype=unsharded_param_dtype,
             )
@@ -1231,6 +1304,8 @@ class FlatParamHandle:
                     dtype=flat_param.dtype,  # full precision
                 )
                 _free_storage(flat_param._full_prec_full_param_padded)
+
+            self._next_layer()
 
     ###################
     # UNSHARD/RESHARD #
@@ -1265,10 +1340,51 @@ class FlatParamHandle:
             ret = True
         elif self._offload_params and self.flat_param.device != self.device:
             # NOTE: This creates a new tensor distinct from any attributes.
-            self.flat_param_to(self.device, non_blocking=True)
+            #if type(self).pin_front_layers and type(self).cur_layer < type(self).num_front_layers:
+            #    if self.device == torch.device("cpu"):
+            #        pass
+            # Yechen: change number to larger than smaller shard
+            #elif (torch.numel(self.flat_param.data) >= type(self).smaller_shard_upper_bound):
+            if (torch.numel(self.flat_param.data) != type(self).fixed_shard):
+                self.flat_param_to(self.device, non_blocking=True)
             ret = True
+
+        print("Rank:", self.rank, "cur_layer:", type(self).cur_layer, "self.flat_param:", self.flat_param.numel(), flush=True)
         self._check_on_compute_device(self.flat_param)
         return ret
+
+    def pre_allgather(self):
+        padded_unsharded_flat_param = self._alloc_padded_unsharded_flat_param()
+        
+        if type(self).flip == 0:
+            start_idx_list = [type(self).s_shard, type(self).l_shard, type(self).s_shard, type(self).l_shard]
+            #[4*30198988, 4*70464308, 4*30198988, 4*70464308]#[301990, 301687899, 301990, 301687897]
+        else:
+            start_idx_list = [type(self).l_shard, type(self).s_shard, type(self).l_shard, type(self).s_shard]
+            #[4*70464308, 4*30198988, 4*70464308, 4*30198988]#[301687899, 301990, 301687899, 301988]
+        tensor_list = []
+        cur_idx = 0
+        for i in range(self.world_size):
+            start = cur_idx
+            end = cur_idx + start_idx_list[i]
+            cur_idx += start_idx_list[i]
+            print(start, ",", end)
+            tensor_list.append(padded_unsharded_flat_param[int(start):int(end)])
+        
+        pg = (
+            self._fake_process_group
+            if self._use_fake_all_gather
+            else self.process_group
+        )
+        
+        for i in [0+type(self).flip, 2+type(self).flip]:
+            print("Rank", self.rank, "pre_shard broadcast size:", tensor_list[i].numel())
+            dist.broadcast(
+                tensor_list[i],
+                i,
+                pg,
+            )
+        return
 
     def _use_low_precision_shard(self):
         """Allocate on the compute device and switch to using the low precision sharded flat parameter."""
@@ -1382,10 +1498,14 @@ class FlatParamHandle:
         )
         sharded_flat_param = self.flat_param.data
         expected_numel = sharded_flat_param.numel() * self.world_size
-        _p_assert(
+        if self.rank == self.world_size - 1:
+            sharded_flat_param = sharded_flat_param[:sharded_flat_param.numel()]
+        print("padded_unsharded_flat_param:", padded_unsharded_flat_param.shape, flush=True)
+        print("rank:", self.rank, "sharded_flat_param:", sharded_flat_param.shape, type(self).backward, type(self).cur_layer, type(self).flip, flush=True)
+        """ _p_assert(
             padded_unsharded_flat_param.numel() == expected_numel,
             f"Expects {expected_numel} numel but got {padded_unsharded_flat_param.numel()}",
-        )
+        ) """
 
         pg = (
             self._fake_process_group
@@ -1400,11 +1520,62 @@ class FlatParamHandle:
             )
             dist.all_gather(tensor_list, sharded_flat_param, group=pg)
         else:
-            dist.all_gather_into_tensor(
-                padded_unsharded_flat_param,
+            start_idx_list = []
+            if not type(self).backward:
+                if type(self).flip == 0:
+                    for i in range(self.world_size - 1):
+                        size = type(self).s_shard if i%2==0 else type(self).l_shard
+                        start_idx_list.append(size)
+                    #start_idx_list = [type(self).s_shard, type(self).l_shard, type(self).s_shard, type(self).l_shard]
+                    #[4*30198988, 4*70464308, 4*30198988, 4*70464308]#[301990, 301687899, 301990, 301687897]
+                else:
+                    for i in range(self.world_size - 1):
+                        size = type(self).s_shard if i%2==1 else type(self).l_shard
+                        start_idx_list.append(size)
+                    #start_idx_list = [type(self).l_shard, type(self).s_shard, type(self).l_shard, type(self).s_shard]
+                    #[4*70464308, 4*30198988, 4*70464308, 4*30198988]#[301687899, 301990, 301687899, 301988]
+            else:
+                if type(self).flip == 1:
+                    for i in range(self.world_size - 1):
+                        size = type(self).s_shard if i%2==0 else type(self).l_shard
+                        start_idx_list.append(size)
+                else:
+                    for i in range(self.world_size - 1):
+                        size = type(self).s_shard if i%2==1 else type(self).l_shard
+                        start_idx_list.append(size)
+            tensor_list = []
+            cur_idx = 0
+            for i in range(self.world_size - 1):
+                start = cur_idx
+                end = cur_idx + start_idx_list[i]
+                cur_idx += start_idx_list[i]
+                print(start, ",", end)
+                tensor_list.append(padded_unsharded_flat_param[int(start):int(end)])
+            tensor_list.append(padded_unsharded_flat_param[int(cur_idx):])
+            print("tensor_list:", flush=True)
+            for t in tensor_list:
+                print(t.shape, flush=True)
+
+            #for i in [1-type(self).flip, 3-type(self).flip]:
+            #    dist.broadcast(
+            #        tensor_list[i],
+            #        i,
+            #        pg,
+            #        True,
+            #    )
+
+            dist.all_gather(
+                tensor_list,
+            #dist.all_gather_into_tensor(
+                #padded_unsharded_flat_param,
                 sharded_flat_param,
                 pg,
             )
+            if type(self).enable_flip:
+                print("FLIPPING HERE (1)", flush=True)
+                type(self).flip ^= 1
+        
+        self._next_layer()
 
         if self._offload_params:
             # In case of offloading, `flat_param.data` (i.e. sharded param) is
@@ -1763,12 +1934,17 @@ class FlatParamHandle:
             # Only incur the extra `.data` call if needed
             if skip_use_sharded_views:
                 unsharded_flat_param = flat_param.data
-        if self._offload_params:
+        print("_use_sharded_flat_param: type(self).cur_layer:", type(self).cur_layer)
+        print("self.flat_param._local_shard.shape:", self.flat_param._local_shard.shape, "self.flat_param._local_shard.device:", self.flat_param._local_shard.device)
+        # Yechen: change size to larger than smaller shard
+        #if self._offload_params and torch.numel(self.flat_param._local_shard) >= type(self).smaller_shard_upper_bound \
+        if self._offload_params and torch.numel(self.flat_param._local_shard) != type(self).fixed_shard \
+            and type(self).cur_layer > type(self).num_front_layers + 1:
             device = flat_param._local_shard.device  # type: ignore[attr-defined]
-            _p_assert(
-                device == torch.device("cpu"),
-                f"Expects the local shard to be on CPU but got {device}",
-            )
+            #_p_assert(
+            #    device == torch.device("cpu"),
+            #    f"Expects the local shard to be on CPU but got {device}",
+            #)
         flat_param.data = flat_param._local_shard  # type: ignore[attr-defined]
         if self._use_orig_params:
             if skip_use_sharded_views:  # type: ignore[possibly-undefined]
@@ -2402,6 +2578,16 @@ class FlatParamHandle:
     ###########
     def flat_param_to(self, *args, **kwargs):
         """Wrap an in-place call to ``.to()`` for ``self.flat_param``."""
+        cpu_device = torch.device("cpu")
+        if args[0] == cpu_device:
+            # Yechen: change size to larger than smaller shard
+            #if torch.numel(self.flat_param.data) < type(self).smaller_shard_upper_bound:
+            if torch.numel(self.flat_param.data) == type(self).fixed_shard:
+                return
+            if type(self).pin_front_layers and type(self).cur_layer > 0 and \
+                type(self).cur_layer <= type(self).num_front_layers:
+                print("flat_param_to: type(self).cur_layer:", type(self).cur_layer)
+                return
         self.flat_param.data = self.flat_param.to(*args, **kwargs)
         if self._use_orig_params:
             # Refresh the views because their storage may have changed

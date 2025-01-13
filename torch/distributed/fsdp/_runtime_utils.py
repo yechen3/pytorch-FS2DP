@@ -157,12 +157,12 @@ def _check_flat_params_on_expected_device(state: _FSDPState, module: nn.Module):
                 f"{handle.flat_param.device}. Make sure to move the module to "
                 f"{state.compute_device} before training."
             )
-        elif handle._offload_params and handle.flat_param.device != cpu_device:
-            raise RuntimeError(
-                "An FSDP-managed module with parameter CPU offloading enabled "
-                f"has parameters on {handle.flat_param.device}. Make sure to "
-                f"not move the module from CPU when offloading parameters."
-            )
+        #elif handle._offload_params and handle.flat_param.device != cpu_device:
+        #    raise RuntimeError(
+        #        "An FSDP-managed module with parameter CPU offloading enabled "
+        #        f"has parameters on {handle.flat_param.device}. Make sure to "
+        #        f"not move the module from CPU when offloading parameters."
+        #    )
 
 
 @no_type_check
@@ -298,6 +298,7 @@ def _unshard(
             ):
                 event.synchronize()
     with state._device_handle.stream(unshard_stream):
+        #handle.pre_allgather()
         handle.unshard()
         handle.post_unshard()
 
@@ -632,6 +633,9 @@ def _pre_backward_hook(
     """
     # Only run the pre-backward hook once per group of handles involved in the
     # same module forward computation
+    if not FlatParamHandle.backward:
+        FlatParamHandle.backward = True
+        FlatParamHandle.flip ^= 1
     if (
         handle
         and hasattr(handle, "_ran_pre_backward_hook")
@@ -844,11 +848,13 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
             if handle._use_fake_reduce
             else state.process_group
         )
-        dist.reduce_scatter_tensor(
+        #dist.reduce_scatter_tensor(
+        dist.reduce_scatter(
             new_sharded_grad,
-            padded_unsharded_grad,
+            [padded_unsharded_grad],
             group=pg,
         )
+        print("rank", state.rank, "I'm here")
         if uses_hybrid_sharded_strategy:
             # Don't wait during trace
             if not torch.distributed._functional_collectives.is_torchdynamo_compiling():
@@ -882,12 +888,18 @@ def _get_reduce_scatter_tensors(
     """
     Returns the input and output tensors to reduce-scatter, respectively.
     """
-    chunks = list(unsharded_grad.chunk(state.world_size))
-    numel_to_pad = state.world_size * chunks[0].numel() - unsharded_grad.numel()
-    padded_unsharded_grad = (
-        F.pad(unsharded_grad, [0, numel_to_pad]) if numel_to_pad > 0 else unsharded_grad
-    )
-    new_sharded_grad = torch.empty_like(chunks[0])  # padded
+    #chunks = list(unsharded_grad.chunk(state.world_size))
+    #numel_to_pad = state.world_size * chunks[0].numel() - unsharded_grad.numel()
+    #padded_unsharded_grad = (
+    #    F.pad(unsharded_grad, [0, numel_to_pad]) if numel_to_pad > 0 else unsharded_grad
+    #)
+    #new_sharded_grad = torch.empty_like(chunks[0])  # padded
+    padded_unsharded_grad = unsharded_grad
+    if (state.rank+FlatParamHandle.flip+1)%2==0 :
+        size = FlatParamHandle.s_shard
+    else:
+        size = FlatParamHandle.l_shard
+    new_sharded_grad = torch.empty(size, dtype=unsharded_grad.dtype, layout=unsharded_grad.layout, device=unsharded_grad.device)
     return padded_unsharded_grad, new_sharded_grad
 
 
@@ -971,6 +983,7 @@ def _offload_grad(
     # the optimizer step executes on CPU. If we want to use non-blocking=True
     # here, we'll have to synchronize before using result on CPU.
     non_blocking = handle.uses_sharded_strategy and not handle._has_optim_in_backward
+    print("rank:", state.rank, "layer:", FlatParamHandle.cur_layer, "grad_to_offload:", grad_to_offload.numel(), "handle.flat_param._cpu_grad:", handle.flat_param._cpu_grad.numel())
     handle.flat_param._cpu_grad.copy_(
         grad_to_offload.detach(), non_blocking=non_blocking
     )  # synchronized in the post-backward callback
