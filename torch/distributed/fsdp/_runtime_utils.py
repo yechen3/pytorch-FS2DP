@@ -1,6 +1,7 @@
 # mypy: allow-untyped-defs
 import functools
 import logging
+import os
 from enum import auto, Enum
 from typing import Any, Callable, Dict, List, no_type_check, Optional, Set, Tuple
 
@@ -633,9 +634,9 @@ def _pre_backward_hook(
     """
     # Only run the pre-backward hook once per group of handles involved in the
     # same module forward computation
-    if not FlatParamHandle.backward:
+    """if not FlatParamHandle.backward:
         FlatParamHandle.backward = True
-        FlatParamHandle.flip ^= 1
+        FlatParamHandle.flip ^= 1"""
     if (
         handle
         and hasattr(handle, "_ran_pre_backward_hook")
@@ -848,12 +849,24 @@ def _reduce_grad(state: _FSDPState, handle: FlatParamHandle) -> None:
             if handle._use_fake_reduce
             else state.process_group
         )
-        #dist.reduce_scatter_tensor(
-        dist.reduce_scatter(
+        numel_per_layer = os.environ.get('NUM_PER_LAYER')
+        if numel_per_layer is None:
+            print("Error: Environment variable NUM_PER_LAYER not found.")
+        else:
+            numel_per_layer = int(numel_per_layer)
+        if padded_unsharded_grad.numel() == numel_per_layer:
+            dist.reduce_scatter_tensor(
             new_sharded_grad,
-            [padded_unsharded_grad],
+            padded_unsharded_grad,
             group=pg,
         )
+        else:
+            #dist.reduce_scatter_tensor(
+            dist.reduce_scatter(
+                new_sharded_grad,
+                [padded_unsharded_grad],
+                group=pg,
+            )
         print("rank", state.rank, "I'm here")
         if uses_hybrid_sharded_strategy:
             # Don't wait during trace
@@ -888,18 +901,26 @@ def _get_reduce_scatter_tensors(
     """
     Returns the input and output tensors to reduce-scatter, respectively.
     """
-    #chunks = list(unsharded_grad.chunk(state.world_size))
-    #numel_to_pad = state.world_size * chunks[0].numel() - unsharded_grad.numel()
-    #padded_unsharded_grad = (
-    #    F.pad(unsharded_grad, [0, numel_to_pad]) if numel_to_pad > 0 else unsharded_grad
-    #)
-    #new_sharded_grad = torch.empty_like(chunks[0])  # padded
-    padded_unsharded_grad = unsharded_grad
-    if (state.rank+FlatParamHandle.flip+1)%2==0 :
-        size = FlatParamHandle.s_shard
+    numel_per_layer = os.environ.get('NUM_PER_LAYER')
+    if numel_per_layer is None:
+        print("Error: Environment variable NUM_PER_LAYER not found.")
     else:
-        size = FlatParamHandle.l_shard
-    new_sharded_grad = torch.empty(size, dtype=unsharded_grad.dtype, layout=unsharded_grad.layout, device=unsharded_grad.device)
+        numel_per_layer = int(numel_per_layer)
+    if unsharded_grad.numel() == numel_per_layer:
+        padded_unsharded_grad = unsharded_grad
+        if (state.rank+FlatParamHandle.flip+1)%2==0 :
+            size = FlatParamHandle.s_shard
+        else:
+            size = FlatParamHandle.l_shard
+        new_sharded_grad = torch.empty(size, dtype=unsharded_grad.dtype, layout=unsharded_grad.layout, device=unsharded_grad.device)
+    else:
+        chunks = list(unsharded_grad.chunk(state.world_size))
+        numel_to_pad = state.world_size * chunks[0].numel() - unsharded_grad.numel()
+        padded_unsharded_grad = (
+            F.pad(unsharded_grad, [0, numel_to_pad]) if numel_to_pad > 0 else unsharded_grad
+        )
+        new_sharded_grad = torch.empty_like(chunks[0])  # padded
+        
     return padded_unsharded_grad, new_sharded_grad
 
 
@@ -983,7 +1004,8 @@ def _offload_grad(
     # the optimizer step executes on CPU. If we want to use non-blocking=True
     # here, we'll have to synchronize before using result on CPU.
     non_blocking = handle.uses_sharded_strategy and not handle._has_optim_in_backward
-    print("rank:", state.rank, "layer:", FlatParamHandle.cur_layer, "grad_to_offload:", grad_to_offload.numel(), "handle.flat_param._cpu_grad:", handle.flat_param._cpu_grad.numel())
+    if state.rank == 0:
+        print("rank:", state.rank, "layer:", FlatParamHandle.cur_layer, "grad_to_offload:", grad_to_offload.numel(), "handle.flat_param._cpu_grad:", handle.flat_param._cpu_grad.numel())
     handle.flat_param._cpu_grad.copy_(
         grad_to_offload.detach(), non_blocking=non_blocking
     )  # synchronized in the post-backward callback
