@@ -481,7 +481,7 @@ class FlatParamHandle:
     
     enable_flip = True
     flip = 0
-    pin_front_layers = False
+    pin_front_layers = True
     num_front_layers = 3
     num_layers = int(os.environ.get('NUM_LAYERS'))
     cur_layer = 0
@@ -970,7 +970,7 @@ class FlatParamHandle:
         if self._use_orig_params:
             self._use_sharded_views()
         if self.rank == 0:
-            print(f"flat_param size: {flat_param.numel()}")
+            print(f"flat_param size: {flat_param.numel()} {flat_param.data_ptr()}, flat_param device: {flat_param.device}")
         if sharded_flat_param.numel() == type(self).s_shard or sharded_flat_param.numel() == type(self).l_shard:
             if type(self).enable_flip:
                 if self.rank == 0:
@@ -1261,7 +1261,7 @@ class FlatParamHandle:
         if self.rank == 0:
             print("init_flat_param_attributes: type(self).cur_layer:", type(self).cur_layer)
             print("self.flat_param device:", self.flat_param.device)
-            print("flat_param.data:", flat_param.data.numel())
+            print("flat_param.data:", flat_param.data.numel(), flat_param.data_ptr())
         #if self._offload_params and torch.numel(self.flat_param.data) >= type(self).smaller_shard_upper_bound \
         if self._offload_params and torch.numel(self.flat_param.data) != type(self).fixed_shard \
             and type(self).cur_layer >= type(self).num_front_layers:
@@ -1382,6 +1382,7 @@ class FlatParamHandle:
         if self.rank == 0:
             print("Rank:", self.rank, "cur_layer:", type(self).cur_layer, "self.flat_param:", self.flat_param.numel(), flush=True)
         self._check_on_compute_device(self.flat_param)
+        #self._next_layer()
         return ret
 
     def pre_allgather(self):
@@ -1729,6 +1730,7 @@ class FlatParamHandle:
             self._check_sharded(flat_param.grad)
             flat_param._saved_grad_shard = flat_param.grad  # type: ignore[attr-defined]
             sharded_grad = flat_param._saved_grad_shard  # type: ignore[attr-defined]
+        print(f"padded_unsharded_grad device: {self.device}")
         padded_unsharded_grad = torch.empty(
             flat_param._padded_unsharded_size,  # type: ignore[attr-defined]
             device=self.device,
@@ -1832,6 +1834,7 @@ class FlatParamHandle:
         flat_param = self.flat_param
         # TODO (awgu): We should replace these conditional checks to encode
         # the logical intention more directly.
+        print(f"prepare_gradient_for_optim size: {flat_param.numel()} {flat_param.data_ptr()}, cur_layer: {type(self).cur_layer}")
         if hasattr(flat_param, "_cpu_grad"):
             # NOTE: This branch includes `NO_SHARD`.
             self._check_sharded(flat_param)
@@ -2621,18 +2624,28 @@ class FlatParamHandle:
     ###########
     def flat_param_to(self, *args, **kwargs):
         """Wrap an in-place call to ``.to()`` for ``self.flat_param``."""
+        flat_param = self.flat_param
+        if self.rank == 0:
+            print(f"flat_param_to: type(self).cur_layer: {type(self).cur_layer}, target device: {args[0]}")
+            print("flat_param.data:", flat_param.data.numel())
         cpu_device = torch.device("cpu")
+        jump = False
         if args[0] == cpu_device:
             # Yechen: change size to larger than smaller shard
             #if torch.numel(self.flat_param.data) < type(self).smaller_shard_upper_bound:
             if torch.numel(self.flat_param.data) == type(self).fixed_shard:
-                return
-            if type(self).pin_front_layers and type(self).cur_layer > 0 and \
-                type(self).cur_layer <= type(self).num_front_layers:
+                jump = True
+            if type(self).pin_front_layers and \
+                    ((type(self).cur_layer == 0 and self.flat_param.data.numel() != type(self).l_shard and self.flat_param.data.numel() > 100000) or \
+                    (type(self).cur_layer > 0 and type(self).cur_layer < type(self).num_front_layers-1 and self.flat_param.data.numel() > 100000) or \
+                     (type(self).cur_layer == type(self).num_front_layers-1 and self.flat_param.data.numel() == type(self).l_shard)   ):
                 if self.rank == 0:
                     print("flat_param_to: type(self).cur_layer:", type(self).cur_layer)
-                return
-        self.flat_param.data = self.flat_param.to(*args, **kwargs)
+                jump = True
+        if not jump:
+            self.flat_param.data = self.flat_param.to(*args, **kwargs)
+        if self.rank == 0:
+            print("after flat_param_to device:", self.flat_param.device)
         if self._use_orig_params:
             # Refresh the views because their storage may have changed
             if self.is_sharded(self.flat_param):

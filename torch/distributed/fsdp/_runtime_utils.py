@@ -416,6 +416,7 @@ def _pre_forward_unshard(
     # If the handles have been prefetched, then there is no need to call
     # `_unshard()` again
     if not handle._prefetched:
+        print("HERE 3")
         _unshard(state, handle, state._unshard_stream, state._pre_unshard_stream)
     handle._needs_pre_forward_unshard = False
     # Don't wait during trace
@@ -668,6 +669,7 @@ def _pre_backward_hook(
             # If the handles have been prefetched, then there is no need to
             # call `_unshard()` again
             if not handle._prefetched:
+                print("HERE 1")
                 _unshard(
                     state,
                     handle,
@@ -790,6 +792,7 @@ def _post_backward_reshard(
     *unused: Any,
 ) -> None:
     free_unsharded_flat_param = _should_free_in_backward(state, handle)
+    print(f"_post_backward_reshard: {free_unsharded_flat_param}")
     _reshard(state, handle, free_unsharded_flat_param)
 
     # TODO: Post-backward prefetching does not support the multiple handles
@@ -1254,6 +1257,7 @@ def _prefetch_handle(
         raise ValueError(f"Invalid prefetch mode on rank {state.rank}: {prefetch_mode}")
     # Prefetch the next set of handles without synchronizing to allow
     # the sync to happen as late as possible to maximize overlap
+    print("HERE 2")
     _unshard(state, handle, state._unshard_stream, state._pre_unshard_stream)
     handle._training_state = prev_training_state
     handle._prefetched = True
